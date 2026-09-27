@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>bundleid</key>
+	<string>com.nixsiow.eject-all</string>
+	<key>category</key>
+	<string>Tools</string>
+	<key>connections</key>
+	<dict>
+		<key>A1B2C3D4-0001-4000-8000-000000000001</key>
+		<array>
+			<dict>
+				<key>destinationuid</key>
+				<string>A1B2C3D4-0002-4000-8000-000000000002</string>
+				<key>modifiers</key>
+				<integer>0</integer>
+				<key>modifiersubtext</key>
+				<string></string>
+				<key>vitoclose</key>
+				<false/>
+			</dict>
+		</array>
+	</dict>
+	<key>createdby</key>
+	<string>nixsiow</string>
+	<key>description</key>
+	<string>Eject all external disks, stopping Time Machine first</string>
+	<key>disabled</key>
+	<false/>
+	<key>name</key>
+	<string>Eject All</string>
+	<key>objects</key>
+	<array>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>argumenttype</key>
+				<integer>2</integer>
+				<key>keyword</key>
+				<string>eject</string>
+				<key>subtext</key>
+				<string>Stops Time Machine if running, then ejects every external disk</string>
+				<key>text</key>
+				<string>Eject All External Disks</string>
+				<key>withspace</key>
+				<false/>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.input.keyword</string>
+			<key>uid</key>
+			<string>A1B2C3D4-0001-4000-8000-000000000001</string>
+			<key>version</key>
+			<integer>1</integer>
+		</dict>
+		<dict>
+			<key>config</key>
+			<dict>
+				<key>concurrently</key>
+				<false/>
+				<key>escaping</key>
+				<integer>102</integer>
+				<key>script</key>
+				<string>exec "$HOME/bin/eject-all" --notify</string>
+				<key>scriptargtype</key>
+				<integer>1</integer>
+				<key>scriptfile</key>
+				<string></string>
+				<key>type</key>
+				<integer>0</integer>
+			</dict>
+			<key>type</key>
+			<string>alfred.workflow.action.script</string>
+			<key>uid</key>
+			<string>A1B2C3D4-0002-4000-8000-000000000002</string>
+			<key>version</key>
+			<integer>2</integer>
+		</dict>
+	</array>
+	<key>readme</key>
+	<string>Type "eject" in Alfred to safely eject every external physical disk (USB / Thunderbolt, including drives on a dock).
+
+The work is done by ~/bin/eject-all (installed by https://github.com/nixsiow/mac-tools), which:
+  - never touches the internal SSD, the boot disk, disk images or network shares
+  - stops a running Time Machine backup and waits for it to finish cleanly first
+  - never force-ejects
+  - posts a notification: "Safe to unplug" or "Do NOT unplug yet" with the reason
+
+Run "eject-all --help" in a terminal for CLI options (dry-run, timeout, verbose).
+Log: ~/Library/Logs/eject-all.log</string>
+	<key>uidata</key>
+	<dict>
+		<key>A1B2C3D4-0001-4000-8000-000000000001</key>
+		<dict>
+			<key>xpos</key>
+			<real>60</real>
+			<key>ypos</key>
+			<real>60</real>
+		</dict>
+		<key>A1B2C3D4-0002-4000-8000-000000000002</key>
+		<dict>
+			<key>xpos</key>
+			<real>320</real>
+			<key>ypos</key>
+			<real>60</real>
+		</dict>
+	</dict>
+	<key>userconfigurationconfig</key>
+	<array/>
+	<key>version</key>
+	<string>1.0.0</string>
+	<key>webaddress</key>
+	<string>https://github.com/nixsiow/mac-tools</string>
+</dict>
+</plist>

@@ -1,0 +1,384 @@
+#!/bin/bash
+#
+# eject-all -- safely eject every external physical disk attached to this Mac.
+#
+# Intended for the "unplug the dock at the end of the day" routine. It:
+#   1. Finds every whole disk that macOS reports as external + physical
+#      (USB / Thunderbolt drives, including those behind a dock). Disk images,
+#      network shares, the internal SSD and the disk you booted from are never
+#      touched.
+#   2. If a Time Machine backup is running, asks it to stop and waits for it to
+#      finish cleanly. If it will not stop within the timeout, NOTHING is
+#      ejected and you are told not to unplug.
+#   3. Ejects each disk (whole-disk eject, so multi-volume drives and APFS
+#      containers go in one step). Never forces. Retries a few times to ride
+#      out short-lived holders (Spotlight, Finder previews).
+#   4. Reports the result on stdout and, when run outside a terminal (Alfred,
+#      Shortcuts, launchd), as a macOS notification. Anything that refused to
+#      eject is listed together with the processes holding it open.
+#
+# Exit codes: 0 all ejected (or nothing to eject)
+#             1 one or more disks could not be ejected
+#             2 Time Machine did not stop; nothing was ejected
+#            64 usage error
+#            75 another eject-all is already running
+#
+set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export LC_ALL=C
+IFS=$'\n\t'
+
+readonly PROG="eject-all"
+readonly VERSION="1.0.0"
+readonly LOG_FILE="${HOME}/Library/Logs/${PROG}.log"
+readonly LOCK_DIR="${TMPDIR:-/tmp}/${PROG}.lock"
+
+DRY_RUN=0
+NOTIFY="auto"          # auto | yes | no
+TM_TIMEOUT=90          # seconds to wait for Time Machine to stop
+EJECT_ATTEMPTS=3
+EJECT_RETRY_DELAY=2
+VERBOSE=0
+LAST_ERR=""
+
+# --------------------------------------------------------------------------- #
+# Output helpers
+# --------------------------------------------------------------------------- #
+
+usage() {
+    cat <<EOF
+Usage: ${PROG} [options]
+
+Eject all external physical disks, stopping Time Machine first if needed.
+
+Options:
+  -n, --dry-run          Show what would happen; change nothing
+      --notify           Always post a macOS notification
+      --no-notify        Never post a notification
+  -t, --timeout SECONDS  Max time to wait for Time Machine to stop (default ${TM_TIMEOUT})
+  -v, --verbose          Show diskutil/tmutil output
+  -h, --help             Show this help
+      --version          Show version
+
+By default a notification is posted only when stdout is not a terminal
+(e.g. when launched from Alfred). Log: ${LOG_FILE}
+EOF
+}
+
+say() { printf '%s\n' "$*"; }
+vsay() { [[ $VERBOSE -eq 1 ]] && printf '  %s\n' "$*" >&2 || true; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+die() { warn "$1"; exit "${2:-1}"; }
+
+log() {
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || return 0
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+should_notify() {
+    case "$NOTIFY" in
+        yes) return 0 ;;
+        no)  return 1 ;;
+        *)   [[ ! -t 1 ]] ;;
+    esac
+}
+
+# notify TITLE BODY [SOUND]
+# Arguments are passed via argv so volume/process names can never be
+# interpreted as AppleScript.
+notify() {
+    should_notify || return 0
+    local title="$1" body="$2" sound="${3:-}"
+    osascript - "$title" "$body" "$sound" >/dev/null 2>&1 <<'APPLESCRIPT' || true
+on run argv
+    set t to item 1 of argv
+    set b to item 2 of argv
+    set s to item 3 of argv
+    if s is "" then
+        display notification b with title t
+    else
+        display notification b with title t sound name s
+    end if
+end run
+APPLESCRIPT
+}
+
+# --------------------------------------------------------------------------- #
+# Locking (prevents a double-trigger from running two ejects at once)
+# --------------------------------------------------------------------------- #
+
+release_lock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; }
+
+acquire_lock() {
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s' "$$" >"$LOCK_DIR/pid"
+        trap release_lock EXIT
+        return 0
+    fi
+    local pid
+    pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        die "another ${PROG} is already running (pid ${pid})" 75
+    fi
+    # Stale lock from a killed run.
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || die "cannot create lock ${LOCK_DIR}" 75
+    printf '%s' "$$" >"$LOCK_DIR/pid"
+    trap release_lock EXIT
+}
+
+# --------------------------------------------------------------------------- #
+# Disk discovery
+# --------------------------------------------------------------------------- #
+
+# diskutil info FIELD-LABEL DEVICE  -> value (empty if absent)
+info_field() {
+    local label="$1" dev="$2"
+    diskutil info "$dev" 2>/dev/null |
+        sed -nE "s|^ *${label}: *(.*[^ ]) *\$|\1|p" | head -n 1
+}
+
+# Whole *physical* disk that backs a device or mount point.
+# APFS volumes live on a synthesized disk; follow "APFS Physical Store" back
+# to the real hardware. HFS+/ExFAT volumes use "Part of Whole".
+phys_whole_of() {
+    local dev="$1" store part
+    store="$(info_field 'APFS Physical Store' "$dev")"
+    if [[ "$store" =~ ^(disk[0-9]+)s[0-9]+ ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    part="$(info_field 'Part of Whole' "$dev")"
+    if [[ "$part" =~ ^disk[0-9]+$ ]]; then
+        printf '%s\n' "$part"
+        return 0
+    fi
+    return 1
+}
+
+# Whole physical disk holding the running system. Never eject this.
+root_whole_disk() { phys_whole_of / || printf 'disk0\n'; }
+
+# Candidate whole disks: external AND physical, as classified by diskutil.
+# Two independent sources are merged, because "diskutil list external physical"
+# can return nothing for a few seconds while a freshly plugged drive is still
+# enumerating, even though its volumes are already mounted:
+#   1. diskutil's own external/physical filter
+#   2. the physical disk behind every mounted /Volumes/* entry
+# Every candidate is re-verified by is_safe_target() before anything happens.
+external_disks() {
+    {
+        diskutil list external physical 2>/dev/null |
+            sed -nE 's#^/dev/(disk[0-9]+) \(external, physical\):.*#\1#p'
+
+        local line dev
+        while IFS= read -r line; do
+            [[ "$line" =~ ^(/dev/disk[0-9]+(s[0-9]+)+)\ on\ /Volumes/[^/]+\ \( ]] || continue
+            dev="${BASH_REMATCH[1]}"
+            phys_whole_of "$dev" 2>/dev/null || true
+        done < <(mount)
+    } | sed '/^$/d' | sort -u
+}
+
+# Second, independent check on each candidate before we act on it.
+is_safe_target() {
+    local disk="$1" root="$2"
+    [[ "$disk" =~ ^disk[0-9]+$ ]]            || { vsay "skip $disk: bad identifier"; return 1; }
+    [[ "$disk" != "disk0" && "$disk" != "$root" ]] || { vsay "skip $disk: system disk"; return 1; }
+    [[ "$(info_field 'Whole' "$disk")" == "Yes" ]]           || { vsay "skip $disk: not a whole disk"; return 1; }
+    [[ "$(info_field 'Device Location' "$disk")" == "External" ]] || { vsay "skip $disk: not external"; return 1; }
+    [[ "$(info_field 'Virtual' "$disk")" != "Yes" ]]         || { vsay "skip $disk: virtual"; return 1; }
+    return 0
+}
+
+media_name() {
+    local name
+    name="$(info_field 'Device / Media Name' "$1")"
+    printf '%s\n' "${name:-$1}"
+}
+
+# Mount points of every volume that ultimately lives on DISK.
+mount_points_of() {
+    local disk="$1" line dev mp
+    while IFS= read -r line; do
+        [[ "$line" =~ ^(/dev/disk[0-9]+(s[0-9]+)+)\ on\ (.+)\ \((.*)\)$ ]] || continue
+        dev="${BASH_REMATCH[1]}"
+        mp="${BASH_REMATCH[3]}"
+        [[ "$(phys_whole_of "$dev" 2>/dev/null || true)" == "$disk" ]] && printf '%s\n' "$mp"
+    done < <(mount)
+}
+
+# Names of processes with files open on DISK's volumes (best effort; lsof
+# without root only sees your own processes, so root daemons like backupd are
+# reported separately via Time Machine status).
+blockers_of() {
+    local disk="$1" mp names=""
+    while IFS= read -r mp; do
+        [[ -n "$mp" ]] || continue
+        names+="$(lsof -F c -- "$mp" 2>/dev/null | sed -n 's/^c//p')"$'\n'
+    done < <(mount_points_of "$disk")
+    tm_running && names+="Time Machine"$'\n'
+    printf '%s' "$names" | sed '/^$/d' | sort -u | paste -sd ',' - | sed 's/,/, /g'
+}
+
+# --------------------------------------------------------------------------- #
+# Time Machine
+# --------------------------------------------------------------------------- #
+
+tm_running() { tmutil status 2>/dev/null | grep -q 'Running = 1;'; }
+
+# Returns 0 if TM is idle (or was stopped successfully), 1 otherwise.
+stop_time_machine() {
+    tm_running || { vsay "Time Machine idle"; return 0; }
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        say "[dry-run] Time Machine backup in progress: would run 'tmutil stopbackup' and wait up to ${TM_TIMEOUT}s"
+        return 0
+    fi
+
+    say "Time Machine backup in progress; asking it to stop..."
+    log "tmutil stopbackup"
+    tmutil stopbackup >/dev/null 2>&1 || true
+
+    local waited=0
+    while tm_running; do
+        if (( waited >= TM_TIMEOUT )); then
+            return 1
+        fi
+        sleep 1
+        waited=$((waited + 1))
+        (( waited % 5 == 0 )) && vsay "still waiting for Time Machine (${waited}s)"
+    done
+    say "Time Machine stopped after ${waited}s."
+    log "Time Machine stopped after ${waited}s"
+    return 0
+}
+
+# --------------------------------------------------------------------------- #
+# Eject
+# --------------------------------------------------------------------------- #
+
+eject_disk() {
+    local disk="$1" attempt out
+    LAST_ERR=""
+    for (( attempt = 1; attempt <= EJECT_ATTEMPTS; attempt++ )); do
+        if out="$(diskutil eject "$disk" 2>&1)"; then
+            vsay "$out"
+            return 0
+        fi
+        LAST_ERR="$out"
+        vsay "attempt ${attempt}/${EJECT_ATTEMPTS} failed: ${out}"
+        (( attempt < EJECT_ATTEMPTS )) && sleep "$EJECT_RETRY_DELAY"
+    done
+    return 1
+}
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+parse_args() {
+    while (( $# )); do
+        case "$1" in
+            -n|--dry-run)   DRY_RUN=1 ;;
+            --notify)       NOTIFY="yes" ;;
+            --no-notify)    NOTIFY="no" ;;
+            -t|--timeout)
+                [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || die "--timeout needs a whole number of seconds" 64
+                TM_TIMEOUT="$2"; shift ;;
+            --timeout=*)
+                TM_TIMEOUT="${1#*=}"
+                [[ "$TM_TIMEOUT" =~ ^[0-9]+$ ]] || die "--timeout needs a whole number of seconds" 64 ;;
+            -v|--verbose)   VERBOSE=1 ;;
+            -h|--help)      usage; exit 0 ;;
+            --version)      say "${PROG} ${VERSION}"; exit 0 ;;
+            *)              usage >&2; die "unknown option: $1" 64 ;;
+        esac
+        shift
+    done
+}
+
+main() {
+    parse_args "$@"
+    acquire_lock
+    trap 'warn "interrupted"; exit 130' INT TERM
+
+    local root disk
+    root="$(root_whole_disk)"
+    vsay "system disk: ${root}"
+
+    local -a targets=()
+    while IFS= read -r disk; do
+        [[ -n "$disk" ]] || continue
+        is_safe_target "$disk" "$root" && targets+=("$disk")
+    done < <(external_disks)
+
+    if (( ${#targets[@]} == 0 )); then
+        say "No external disks attached."
+        notify "Nothing to eject" "No external disks are attached."
+        return 0
+    fi
+
+    local -a names=()
+    for disk in "${targets[@]}"; do
+        names+=("$(media_name "$disk")")
+    done
+
+    if [[ $DRY_RUN -eq 1 ]]; then
+        say "[dry-run] External disks that would be ejected:"
+        local i mps
+        for i in "${!targets[@]}"; do
+            mps="$(mount_points_of "${targets[$i]}" | paste -sd ',' - | sed 's/,/, /g')"
+            if [[ -n "$mps" ]]; then
+                say "  ${targets[$i]}  ${names[$i]}  [mounted: ${mps}]"
+            else
+                say "  ${targets[$i]}  ${names[$i]}  [no mounted volumes]"
+            fi
+        done
+    fi
+
+    if ! stop_time_machine; then
+        local msg="Time Machine did not stop within ${TM_TIMEOUT}s. Nothing was ejected."
+        say "$msg"
+        log "ABORT: $msg"
+        notify "Do NOT unplug yet" "$msg" "Basso"
+        return 2
+    fi
+
+    [[ $DRY_RUN -eq 1 ]] && { say "[dry-run] No changes made."; return 0; }
+
+    local -a ejected=() failed=()
+    local i name who
+    for i in "${!targets[@]}"; do
+        disk="${targets[$i]}"; name="${names[$i]}"
+        if eject_disk "$disk"; then
+            say "Ejected  ${name} (${disk})"
+            log "ejected ${disk} ${name}"
+            ejected+=("$name")
+        else
+            who="$(blockers_of "$disk")"
+            say "FAILED   ${name} (${disk})${who:+ - in use by: ${who}}"
+            [[ -n "$LAST_ERR" ]] && say "         ${LAST_ERR//$'\n'/ }"
+            log "FAILED ${disk} ${name} blockers=[${who}] err=[${LAST_ERR//$'\n'/ }]"
+            failed+=("${name}${who:+ (${who})}")
+        fi
+    done
+
+    local ejected_list failed_list
+    ejected_list="$(printf '%s\n' "${ejected[@]+"${ejected[@]}"}" | sed '/^$/d' | paste -sd ',' - | sed 's/,/, /g')"
+    failed_list="$(printf '%s\n' "${failed[@]+"${failed[@]}"}" | sed '/^$/d' | paste -sd ';' - | sed 's/;/; /g')"
+
+    if (( ${#failed[@]} == 0 )); then
+        say "All external disks ejected. Safe to unplug."
+        notify "Safe to unplug" "Ejected: ${ejected_list}"
+        return 0
+    fi
+
+    say "Some disks could NOT be ejected. Do not unplug yet."
+    notify "Do NOT unplug yet" "Could not eject: ${failed_list}${ejected_list:+. Ejected: ${ejected_list}}" "Basso"
+    return 1
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
